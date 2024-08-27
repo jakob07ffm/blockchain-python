@@ -1,6 +1,7 @@
 import hashlib
 import time
 import json
+import random
 from collections import OrderedDict
 from ecdsa import SigningKey, VerifyingKey, SECP256k1
 
@@ -57,6 +58,7 @@ class Blockchain:
         self.difficulty = 4
         self.pending_transactions = []
         self.mining_reward = 100
+        self.nodes = []
 
     def create_genesis_block(self):
         return Block(0, "0", time.time(), [])
@@ -71,10 +73,9 @@ class Blockchain:
         block = Block(len(self.chain), self.get_latest_block().hash, time.time(), self.pending_transactions)
         block.mine_block(self.difficulty)
 
-        print(f"Block mined! Hash: {block.hash}")
         self.chain.append(block)
-
         self.pending_transactions = []
+        self.broadcast_block(block)
 
     def add_transaction(self, transaction):
         if not transaction.sender or not transaction.recipient:
@@ -101,29 +102,82 @@ class Blockchain:
 
         return True
 
+    def add_node(self, node):
+        self.nodes.append(node)
+
+    def broadcast_block(self, block):
+        for node in self.nodes:
+            node.receive_block(block)
+
+    def receive_block(self, block):
+        if block.previous_hash != self.get_latest_block().hash:
+            print("Received block does not link properly")
+            return False
+        if not block.has_valid_transactions():
+            print("Received block has invalid transactions")
+            return False
+        if block.hash != block.calculate_hash():
+            print("Received block hash is invalid")
+            return False
+        self.chain.append(block)
+        print(f"Block {block.index} added to the chain")
+        return True
+
+    def resolve_conflicts(self):
+        longest_chain = self.chain
+        for node in self.nodes:
+            node_chain = node.chain
+            if len(node_chain) > len(longest_chain) and node.is_chain_valid():
+                longest_chain = node_chain
+        if longest_chain != self.chain:
+            self.chain = longest_chain
+            return True
+        return False
 
 def create_wallet():
     private_key = SigningKey.generate(curve=SECP256k1)
     public_key = private_key.verifying_key
     return private_key, public_key
 
+class Node:
+    def __init__(self, blockchain):
+        self.blockchain = blockchain
+        self.blockchain.add_node(self)
+
+    def mine(self, mining_reward_address):
+        self.blockchain.mine_pending_transactions(mining_reward_address)
+
+    def receive_block(self, block):
+        return self.blockchain.receive_block(block)
 
 if __name__ == "__main__":
-
+   
     private_key_1, public_key_1 = create_wallet()
     private_key_2, public_key_2 = create_wallet()
 
-    my_blockchain = Blockchain()
 
-    tx1 = Transaction(public_key_1.to_string().hex(), public_key_2.to_string().hex(), 10)
+    main_blockchain = Blockchain()
+    node1 = Node(main_blockchain)
+    node2 = Node(main_blockchain)
+
+
+    tx1 = Transaction(public_key_1.to_string().hex(), public_key_2.to_string().hex(), 50)
     tx1.sign_transaction(private_key_1)
-    my_blockchain.add_transaction(tx1)
+    main_blockchain.add_transaction(tx1)
 
 
-    print("Mining pending transactions...")
-    my_blockchain.mine_pending_transactions(public_key_1.to_string().hex())
+    node1.mine(public_key_1.to_string().hex())
 
-    print(f"Is blockchain valid? {my_blockchain.is_chain_valid()}")
+    node2.receive_block(main_blockchain.get_latest_block())
 
-    for block in my_blockchain.chain:
+
+    if main_blockchain.is_chain_valid():
+        print("Blockchain is valid")
+
+    if main_blockchain.resolve_conflicts():
+        print("Chain was replaced by a longer chain")
+    else:
+        print("No conflicts found")
+
+    for block in main_blockchain.chain:
         print(f"Block {block.index} [Hash: {block.hash}, Previous Hash: {block.previous_hash}, Transactions: {json.dumps([t.__dict__ for t in block.transactions], indent=2)}]")
