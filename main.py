@@ -3,12 +3,49 @@ import time
 import json
 import pickle
 import random
+import sqlite3
 import requests
 from collections import OrderedDict
 from ecdsa import SigningKey, VerifyingKey, SECP256k1
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, abort
 from threading import Thread
 from queue import Queue
+
+class BlockchainDB:
+    def __init__(self, db_name="blockchain.db"):
+        self.conn = sqlite3.connect(db_name)
+        self.create_tables()
+
+    def create_tables(self):
+        with self.conn:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS blocks
+                                 (index INTEGER PRIMARY KEY, previous_hash TEXT, timestamp REAL, 
+                                 merkle_root TEXT, nonce INTEGER, hash TEXT, difficulty INTEGER)''')
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS transactions
+                                 (tx_id TEXT PRIMARY KEY, sender TEXT, recipient TEXT, amount REAL, 
+                                 fee REAL, signature TEXT, block_index INTEGER, FOREIGN KEY(block_index) REFERENCES blocks(index))''')
+
+    def save_block(self, block):
+        with self.conn:
+            self.conn.execute('''INSERT INTO blocks (index, previous_hash, timestamp, merkle_root, nonce, hash, difficulty)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?)''', 
+                                 (block.index, block.previous_hash, block.timestamp, block.merkle_root, block.nonce, block.hash, block.difficulty))
+            for tx in block.transactions:
+                self.conn.execute('''INSERT INTO transactions (tx_id, sender, recipient, amount, fee, signature, block_index)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?)''', 
+                                     (tx.calculate_hash(), tx.sender, tx.recipient, tx.amount, tx.fee, tx.signature, block.index))
+
+    def load_blocks(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''SELECT * FROM blocks ORDER BY index''')
+        blocks = cursor.fetchall()
+        return blocks
+
+    def get_transactions_by_address(self, address):
+        cursor = self.conn.cursor()
+        cursor.execute('''SELECT * FROM transactions WHERE sender = ? OR recipient = ?''', (address, address))
+        transactions = cursor.fetchall()
+        return transactions
 
 class MerkleTree:
     def __init__(self, transactions):
@@ -31,13 +68,20 @@ class MerkleTree:
     def calculate_hash(data):
         return hashlib.sha256(data.encode()).hexdigest()
 
+class SmartContract:
+    def __init__(self, script):
+        self.script = script
+
+    def execute(self, variables):
+        exec(self.script, {}, variables)
+
 class Transaction:
     def __init__(self, sender, recipient, amount, fee=0, contract=None):
         self.sender = sender
         self.recipient = recipient
         self.amount = amount
         self.fee = fee
-        self.contract = contract 
+        self.contract = contract  
         self.signature = ""
 
     def calculate_hash(self):
@@ -49,7 +93,7 @@ class Transaction:
         self.signature = signing_key.sign(self.calculate_hash().encode()).hex()
 
     def is_valid(self):
-        if self.sender == "0":  
+        if self.sender == "0": 
             return True
         if not self.signature or len(self.signature) == 0:
             raise ValueError("No signature in this transaction")
@@ -57,9 +101,11 @@ class Transaction:
         return verifying_key.verify(bytes.fromhex(self.signature), self.calculate_hash().encode())
 
     def execute_contract(self):
-        if self.contract and self.contract['condition']():
-            self.recipient = self.contract['recipient']
-            self.amount = self.contract['amount']
+        if self.contract:
+            variables = {'amount': self.amount, 'sender': self.sender, 'recipient': self.recipient}
+            self.contract.execute(variables)
+            self.recipient = variables['recipient']
+            self.amount = variables['amount']
 
 class Block:
     def __init__(self, index, previous_hash, timestamp, transactions, nonce=0, difficulty=4):
@@ -107,14 +153,33 @@ class Wallet:
     def add_to_history(self, transaction):
         self.history.append(transaction)
 
+class MultiSigWallet(Wallet):
+    def __init__(self, owners, required_signatures):
+        self.owners = owners
+        self.required_signatures = required_signatures
+        self.signatures = []
+        self.balance = 0
+        self.history = []
+
+    def sign_transaction(self, transaction, signing_key):
+        if signing_key.verifying_key.to_string().hex() not in self.owners:
+            raise ValueError("This key is not an owner of the wallet!")
+        signature = signing_key.sign(transaction.calculate_hash().encode()).hex()
+        if signature not in self.signatures:
+            self.signatures.append(signature)
+
+        if len(self.signatures) >= self.required_signatures:
+            transaction.signature = ','.join(self.signatures)
+
 class Blockchain:
-    def __init__(self):
+    def __init__(self, db_name="blockchain.db"):
         self.chain = [self.create_genesis_block()]
         self.difficulty = 4
         self.pending_transactions = []
         self.mining_reward = 100
         self.network = P2PNetwork()
         self.wallets = {}
+        self.db = BlockchainDB(db_name)
 
     def create_genesis_block(self):
         return Block(0, "0", time.time(), [])
@@ -127,12 +192,12 @@ class Blockchain:
 
     def get_wallet_balance(self, wallet_address):
         balance = 0
-        for block in self.chain:
-            for tx in block.transactions:
-                if tx.sender == wallet_address:
-                    balance -= (tx.amount + tx.fee)
-                if tx.recipient == wallet_address:
-                    balance += tx.amount
+        transactions = self.db.get_transactions_by_address(wallet_address)
+        for tx in transactions:
+            if tx[1] == wallet_address:
+                balance -= (tx[3] + tx[4])
+            if tx[2] == wallet_address:
+                balance += tx[3]
         return balance
 
     def add_transaction(self, transaction):
@@ -151,103 +216,51 @@ class Blockchain:
         block.mine_block()
 
         self.chain.append(block)
+        self.db.save_block(block)
         self.pending_transactions = []
-        self.adjust_difficulty()
+
         self.network.broadcast_block(block)
-
-        for tx in block.transactions:
-            if tx.sender in self.wallets:
-                self.wallets[tx.sender].balance -= (tx.amount + tx.fee)
-                self.wallets[tx.sender].add_to_history(tx)
-            if tx.recipient in self.wallets:
-                self.wallets[tx.recipient].balance += tx.amount
-                self.wallets[tx.recipient].add_to_history(tx)
-
-    def adjust_difficulty(self):
-        if len(self.chain) % 10 == 0 and len(self.chain) > 1:
-            last_ten_blocks = self.chain[-10:]
-            times = [last_ten_blocks[i].timestamp - last_ten_blocks[i-1].timestamp for i in range(1, len(last_ten_blocks))]
-            average_time = sum(times) / len(times)
-
-            if average_time < 10:
-                self.difficulty += 1
-            elif average_time > 10:
-                self.difficulty -= 1
 
     def is_chain_valid(self):
         for i in range(1, len(self.chain)):
             current_block = self.chain[i]
             previous_block = self.chain[i - 1]
 
+            if current_block.hash != current_block.calculate_hash():
+                return False
+            if current_block.previous_hash != previous_block.hash:
+                return False
             if not current_block.has_valid_transactions():
                 return False
-
-            if current_block.hash != current_block.calculate_hash():
-                print("Current Hashes do not match")
-                return False
-
-            if current_block.previous_hash != previous_block.hash:
-                print("Previous Hashes do not match")
-                return False
-
         return True
 
-    def add_block(self, block):
-        if self.get_latest_block().hash == block.previous_hash and block.has_valid_transactions():
-            self.chain.append(block)
-            self.adjust_difficulty()
+    def resolve_conflicts(self):
+        longest_chain = self.chain
+        for node in self.network.nodes:
+            if len(node.blockchain.chain) > len(longest_chain) and node.blockchain.is_chain_valid():
+                longest_chain = node.blockchain.chain
 
-    def save_chain(self, filename="blockchain.pkl"):
-        with open(filename, "wb") as f:
-            pickle.dump(self, f)
+        if longest_chain != self.chain:
+            self.chain = longest_chain
+            self.pending_transactions = []
+
+    def save_chain(self):
+        with open("blockchain.pkl", "wb") as f:
+            pickle.dump(self.chain, f)
 
     @staticmethod
-    def load_chain(filename="blockchain.pkl"):
-        with open(filename, "rb") as f:
+    def load_chain():
+        with open("blockchain.pkl", "rb") as f:
             return pickle.load(f)
-
-class P2PNetwork:
-    def __init__(self):
-        self.nodes = []
-
-    def add_node(self, node):
-        self.nodes.append(node)
-
-    def broadcast_transaction(self, transaction):
-        for node in self.nodes:
-            node.receive_transaction(transaction)
-
-    def broadcast_block(self, block):
-        for node in self.nodes:
-            node.receive_block(block)
-
-    def discover_nodes(self):
-        pass
 
 class Node:
     def __init__(self, blockchain):
         self.blockchain = blockchain
-        self.blockchain.network.add_node(self)
         self.pending_transactions = Queue()
 
     def receive_transaction(self, transaction):
+        self.pending_transactions.put(transaction)
         self.blockchain.add_transaction(transaction)
-
-    def receive_block(self, block):
-        if block.previous_hash == self.blockchain.get_latest_block().hash and block.has_valid_transactions():
-            self.blockchain.add_block(block)
-        else:
-            self.resolve_conflicts()
-
-    def resolve_conflicts(self):
-        longest_chain = self.blockchain.chain
-        for node in self.blockchain.network.nodes:
-            if len(node.blockchain.chain) > len(longest_chain) and node.blockchain.is_chain_valid():
-                longest_chain = node.blockchain.chain
-
-        if longest_chain != self.blockchain.chain:
-            self.blockchain.chain = longest_chain
-            self.pending_transactions = Queue()
 
     def mine(self, mining_reward_address):
         while not self.pending_transactions.empty():
@@ -271,6 +284,9 @@ class BlockchainExplorer:
         if index < len(self.blockchain.chain):
             return self.blockchain.chain[index]
         return None
+
+    def get_transactions_by_address(self, address):
+        return self.blockchain.db.get_transactions_by_address(address)
 
 class BlockchainAPI:
     def __init__(self, blockchain):
@@ -311,11 +327,31 @@ class BlockchainAPI:
             chain_data = [block.__dict__ for block in self.blockchain.chain]
             return jsonify(chain_data), 200
 
+        @self.app.route('/explorer/transaction/<tx_hash>', methods=['GET'])
+        def find_transaction(tx_hash):
+            transaction = self.blockchain.db.get_transactions_by_address(tx_hash)
+            if transaction:
+                return jsonify(transaction), 200
+            return jsonify({'message': 'Transaction not found'}), 404
+
+        @self.app.route('/explorer/address/<address>', methods=['GET'])
+        def get_transactions_by_address(address):
+            transactions = self.blockchain.db.get_transactions_by_address(address)
+            return jsonify(transactions), 200
+
+        @self.app.route('/explorer/block/<int:index>', methods=['GET'])
+        def get_block_by_index(index):
+            block = self.blockchain.db.load_blocks()[index]
+            if block:
+                return jsonify(block), 200
+            return jsonify({'message': 'Block not found'}), 404
+
     def run(self, host='0.0.0.0', port=5000):
         self.app.run(host=host, port=port)
 
 
 if __name__ == "__main__":
+
     wallet1 = Wallet()
     wallet2 = Wallet()
 
@@ -323,8 +359,10 @@ if __name__ == "__main__":
     node1 = Node(blockchain)
     node2 = Node(blockchain)
 
+  
     blockchain.add_wallet(wallet1.public_key.to_string().hex(), wallet1)
     blockchain.add_wallet(wallet2.public_key.to_string().hex(), wallet2)
+
 
     tx1 = Transaction(wallet1.public_key.to_string().hex(), wallet2.public_key.to_string().hex(), 10, 1)
     wallet1.sign_transaction(tx1)
@@ -332,10 +370,12 @@ if __name__ == "__main__":
     tx2 = Transaction(wallet2.public_key.to_string().hex(), wallet1.public_key.to_string().hex(), 5, 1)
     wallet2.sign_transaction(tx2)
 
+
     node1.receive_transaction(tx1)
     node2.receive_transaction(tx2)
 
     node1.mine(wallet1.public_key.to_string().hex())
+
 
     blockchain.save_chain()
     loaded_blockchain = Blockchain.load_chain()
