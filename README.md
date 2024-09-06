@@ -21,3 +21,4 @@ This project implements a basic blockchain system with functionalities for creat
 - ecdsa
 - requests
 - sqlite3
+![](block.jpg)
